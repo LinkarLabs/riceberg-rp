@@ -1,0 +1,14 @@
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+runner = "picotool load -u -v -x -t elf"
+
+[build]
+# Default to embedded target for firmware builds
+# For host CLI, use the alias below or specify target explicitly
+target = "thumbv8m.main-none-eabihf"
+
+# Aliases for running host CLI on Windows
+[alias]
+host = "run --bin riceberg_host --target x86_64-pc-windows-msvc --features std --"
+
+[env]
+DEFMT_LOG = "debug"

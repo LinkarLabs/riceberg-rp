@@ -1,0 +1,26 @@
+# Rust
+target/
+Cargo.lock
+
+# Firmware files (binary blobs)
+firmware/
+
+# Debug files
+*.elf
+*.bin
+*.hex
+*.uf2
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code local state
+.claude/

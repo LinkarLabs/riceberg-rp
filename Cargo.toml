@@ -1,0 +1,71 @@
+[package]
+name = "rp"
+version = "0.1.0"
+edition = "2024"
+description = "RP2350 Riceberg Temperature Sensor Database"
+
+[lib]
+name = "rp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "riceberg_host"
+path = "src/bin/riceberg_host.rs"
+required-features = ["std"]
+
+[features]
+default = []
+std = []
+
+[dependencies]
+# Protocol dependencies (work in both no_std and std)
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1.0", default-features = false, features = ["alloc", "heapless"] }
+heapless = { version = "0.8", features = ["serde"] }
+
+[target.'cfg(all(target_arch = "arm", target_os = "none"))'.dependencies]
+# Embedded-only dependencies
+embassy-executor = { version = "0.9", features = [
+  "arch-cortex-m",
+  "executor-thread",
+  "defmt",
+] }
+embassy-rp = { version = "0.9.0", features = [
+  "defmt",
+  "time-driver",
+  "critical-section-impl",
+  "rp235xa",
+  "binary-info",
+] }
+embassy-time = "0.5.0"
+cortex-m = { version = "0.7.6" }
+cortex-m-rt = "0.7.5"
+static_cell = "2"
+defmt = "1.0.1"
+defmt-rtt = "1.0"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+
+embedded-alloc = "0.5"
+
+# Riceberg dependencies
+riceberg-core = { path = "../riceberg/riceberg-core", default-features = false, features = ["embedded"] }
+riceberg-storage = { path = "../riceberg/riceberg-storage", default-features = false, features = ["nor-flash-async"] }
+riceberg-edge = { path = "../riceberg/riceberg-edge", default-features = false, features = ["alloc", "memory-minimal"] }
+embassy-usb = { version = "0.5", default-features = false }
+embassy-sync = { version = "0.6", features = ["defmt"] }
+embassy-futures = "0.1"
+embedded-io-async = "0.7"
+
+# Patch embassy dependencies to use git main (has embedded-io-async 0.7 support)
+# Once embassy 0.10+ is released with 0.7 support, this patch can be removed
+[patch.crates-io]
+embassy-rp = { git = "https://github.com/embassy-rs/embassy" }
+embassy-usb = { git = "https://github.com/embassy-rs/embassy" }
+embassy-executor = { git = "https://github.com/embassy-rs/embassy" }
+embassy-time = { git = "https://github.com/embassy-rs/embassy" }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy" }
+embassy-futures = { git = "https://github.com/embassy-rs/embassy" }
+
+# Enable serialport for host binary
+[target.'cfg(not(target_os = "none"))'.dependencies]
+serialport = "4.2"
