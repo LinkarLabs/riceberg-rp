@@ -318,6 +318,33 @@ fn parse_command(input: &str) -> Result<DbCommand, String> {
 
         "capacity" | "cap" | "space" => Ok(DbCommand::capacity()),
 
+        // Spectral sensor commands
+        "spectral-latest" | "sl" => {
+            let count = if parts.len() > 1 {
+                parts[1]
+                    .parse::<u16>()
+                    .map_err(|_| "Invalid count (must be a positive number)".to_string())?
+            } else {
+                5
+            };
+            Ok(DbCommand::query_spectral_latest(count))
+        }
+
+        "spectral-range" | "sr" => {
+            if parts.len() < 3 {
+                return Err("Usage: spectral-range <start_us> <end_us>".to_string());
+            }
+            let start_us = parts[1]
+                .parse::<i64>()
+                .map_err(|_| "Invalid start timestamp".to_string())?;
+            let end_us = parts[2]
+                .parse::<i64>()
+                .map_err(|_| "Invalid end timestamp".to_string())?;
+            Ok(DbCommand::query_spectral_range(start_us, end_us))
+        }
+
+        "spectral-stats" | "ss" => Ok(DbCommand::spectral_stats()),
+
         cmd => Err(format!("Unknown command: {}", cmd)),
     }
 }
@@ -485,8 +512,48 @@ fn execute_command(
     // Decode COBS-encoded response
     let response: DbResponse = postcard::from_bytes_cobs(&mut rx_buf)?;
 
-    // Display response
-    display_response(&response);
+    // Handle log messages: keep reading until we get a non-Log response
+    if matches!(response, DbResponse::Log { .. }) {
+        display_response(&response);
+
+        // Keep reading for more logs or the final response
+        loop {
+            let mut next_buf = vec![];
+            let mut byte = [0u8; 1];
+            loop {
+                match port.read(&mut byte) {
+                    Ok(1) => {
+                        next_buf.push(byte[0]);
+                        if byte[0] == 0x00 {
+                            break;
+                        }
+                        if next_buf.len() > 65536 {
+                            return Err("Response too large".into());
+                        }
+                    }
+                    Ok(_) => {
+                        if !next_buf.is_empty() {
+                            break;
+                        }
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
+                        if !next_buf.is_empty() {
+                            break;
+                        }
+                        return Err("Timeout waiting for response after log".into());
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            let next_response: DbResponse = postcard::from_bytes_cobs(&mut next_buf)?;
+            display_response(&next_response);
+            if !matches!(next_response, DbResponse::Log { .. }) {
+                break;
+            }
+        }
+    } else {
+        display_response(&response);
+    }
 
     Ok(())
 }
@@ -672,6 +739,61 @@ fn display_response(response: &DbResponse) {
                      (*free_pages as f64 / *total_pages as f64) * 100.0);
             println!("{:-<50}", "");
         }
+
+        DbResponse::SpectralReadings {
+            data,
+            total,
+            has_more,
+        } => {
+            println!("\nSpectral Readings ({} total, showing {}):", total, data.len());
+            println!("{:-<120}", "");
+            println!(
+                "{:<8} {:<15} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>4} {:>3}",
+                "ID", "Timestamp", "F1", "F2", "FZ", "F3", "F4", "F5", "FY", "FXL", "F6", "F7", "F8", "NIR", "Clr", "Flk", "Gain", "Sat"
+            );
+            println!("{:-<120}", "");
+            for reading in data {
+                let ch = &reading.channels;
+                println!(
+                    "{:<8} {:<15} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>4} {:>3}",
+                    reading.id,
+                    format_duration_us(reading.timestamp_us),
+                    ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7],
+                    ch[8], ch[9], ch[10], ch[11], ch[12], ch[13],
+                    reading.gain,
+                    if reading.saturated { "Y" } else { "N" }
+                );
+            }
+            println!("{:-<120}", "");
+            if *has_more {
+                println!("(more readings available)");
+            }
+        }
+
+        DbResponse::SpectralStats {
+            total_readings,
+            oldest_timestamp_us,
+            newest_timestamp_us,
+            snapshot_id,
+        } => {
+            println!("\nSpectral Database Statistics:");
+            println!("{:-<50}", "");
+            println!("Total spectral readings: {}", total_readings);
+            println!(
+                "Oldest reading:         {}",
+                format_duration_us(*oldest_timestamp_us)
+            );
+            println!(
+                "Newest reading:         {}",
+                format_duration_us(*newest_timestamp_us)
+            );
+            println!("Current snapshot ID:    {}", snapshot_id);
+            println!("{:-<50}", "");
+        }
+
+        DbResponse::Log { message } => {
+            println!("[device] {}", message);
+        }
     }
 }
 
@@ -709,6 +831,12 @@ fn print_help() {
     println!("  expire [n]               - Expire old snapshots, keep last N (default: 5)");
     println!("  capacity                 - Show storage capacity information");
     println!("  diag                     - Show system diagnostics (sensor task status)");
+    println!();
+    println!("Spectral Sensor Commands:");
+    println!("  spectral-latest [n]      - Show latest N spectral readings (default: 5)");
+    println!("  spectral-range <s> <e>   - Show spectral readings in time range (us)");
+    println!("  spectral-stats           - Show spectral database statistics");
+    println!();
     println!("  help                     - Show this help");
     println!("  exit                     - Exit shell");
     println!();
@@ -736,4 +864,6 @@ fn print_help() {
     println!("  expire 3                        - Keep only the last 3 snapshots");
     println!("  capacity                        - Check available storage space");
     println!("  diag                            - Check if sensor task is running");
+    println!("  spectral-latest 5               - Show last 5 spectral readings");
+    println!("  spectral-stats                  - Show spectral database statistics");
 }

@@ -45,8 +45,9 @@ extern crate alloc;
 pub mod db_protocol;
 
 pub use db_protocol::{
-    DbCommand, DbResponse, FilterField, FilterOp, FilterValue, QueryFilter, TemperatureReading,
-    MAX_QUERY_FILTERS, MAX_READINGS_PER_RESPONSE,
+    DbCommand, DbResponse, FilterField, FilterOp, FilterValue, QueryFilter,
+    SpectralReadingProtocol, TemperatureReading, MAX_QUERY_FILTERS, MAX_READINGS_PER_RESPONSE,
+    MAX_SPECTRAL_READINGS_PER_RESPONSE,
 };
 
 // ============================================================================
@@ -67,12 +68,12 @@ pub mod adapters;
 
 // Re-export key domain types
 #[cfg(not(feature = "std"))]
-pub use domain::{SensorId, SensorReading, TemperatureCalibration};
+pub use domain::{SensorId, SensorReading, SpectralReading, TemperatureCalibration};
 
 // Re-export key port traits
 #[cfg(not(feature = "std"))]
-pub use ports::{CommunicationPort, SensorPort, StoragePort};
+pub use ports::{CommunicationPort, SensorPort, SpectralSensorPort, StoragePort};
 
 // Re-export adapters
 #[cfg(not(feature = "std"))]
-pub use adapters::{EdgeStorageAdapter, Rp2350TempSensor, UsbCdcAdapter};
+pub use adapters::{As7343Adapter, EdgeStorageAdapter, Rp2350TempSensor, UsbCdcAdapter};

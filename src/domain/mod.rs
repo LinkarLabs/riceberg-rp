@@ -5,6 +5,8 @@
 
 pub mod calibration;
 pub mod reading;
+pub mod spectral;
 
 pub use calibration::TemperatureCalibration;
 pub use reading::{SensorId, SensorReading};
+pub use spectral::SpectralReading;

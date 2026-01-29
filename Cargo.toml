@@ -51,6 +51,11 @@ embedded-alloc = "0.5"
 riceberg-core = { path = "../riceberg/riceberg-core", default-features = false, features = ["embedded"] }
 riceberg-storage = { path = "../riceberg/riceberg-storage", default-features = false, features = ["nor-flash-async"] }
 riceberg-edge = { path = "../riceberg/riceberg-edge", default-features = false, features = ["alloc", "memory-minimal"] }
+
+# AS7343 spectral sensor
+as7343 = { path = "../as7343-rs", default-features = false, features = ["async", "embassy-time", "defmt-03"] }
+embedded-hal-async = "1.0"
+
 embassy-usb = { version = "0.5", default-features = false }
 embassy-sync = { version = "0.6", features = ["defmt"] }
 embassy-futures = "0.1"

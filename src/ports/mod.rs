@@ -14,8 +14,10 @@
 
 pub mod communication;
 pub mod sensor;
+pub mod spectral_sensor;
 pub mod storage;
 
 pub use communication::CommunicationPort;
 pub use sensor::{SensorConfig, SensorError, SensorPort};
+pub use spectral_sensor::{SpectralSensorConfig, SpectralSensorError, SpectralSensorPort};
 pub use storage::{StorageError, StoragePort, StorageStats, MAX_QUERY_RESULTS};

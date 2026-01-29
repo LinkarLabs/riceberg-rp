@@ -222,6 +222,19 @@ pub enum DbCommand {
 
     /// Get storage capacity information
     Capacity,
+
+    // ========================================================================
+    // Spectral sensor commands
+    // ========================================================================
+
+    /// Get latest N spectral readings
+    QuerySpectralLatest { count: u16 },
+
+    /// Get spectral readings in time range (microseconds since boot)
+    QuerySpectralRange { start_us: i64, end_us: i64 },
+
+    /// Get spectral database statistics
+    SpectralStats,
 }
 
 /// Temperature reading (simplified for COBS)
@@ -263,6 +276,63 @@ impl TemperatureReading {
             temperature_c,
             sensor_id: sensor_id.to_string(),
         })
+    }
+}
+
+/// Maximum number of spectral readings per response
+/// Keep small to avoid stack overflow in async tasks on embedded targets
+pub const MAX_SPECTRAL_READINGS_PER_RESPONSE: usize = 4;
+
+/// Spectral reading for protocol transfer
+///
+/// Uses compact channel array instead of named fields to reduce
+/// serialization overhead over COBS/USB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpectralReadingProtocol {
+    /// Unique reading ID
+    pub id: u64,
+    /// Timestamp in microseconds since boot
+    pub timestamp_us: i64,
+    /// All 14 channels as array: [F1, F2, FZ, F3, F4, F5, FY, FXL, F6, F7, F8, NIR, Clear, Flicker]
+    pub channels: [u16; 14],
+    /// Gain setting used for this reading
+    pub gain: u8,
+    /// Whether any channel was saturated
+    pub saturated: bool,
+}
+
+impl SpectralReadingProtocol {
+    /// Channel index constants for named access
+    pub const F1_405NM: usize = 0;
+    pub const F2_425NM: usize = 1;
+    pub const FZ_450NM: usize = 2;
+    pub const F3_475NM: usize = 3;
+    pub const F4_515NM: usize = 4;
+    pub const F5_550NM: usize = 5;
+    pub const FY_555NM: usize = 6;
+    pub const FXL_600NM: usize = 7;
+    pub const F6_640NM: usize = 8;
+    pub const F7_690NM: usize = 9;
+    pub const F8_745NM: usize = 10;
+    pub const NIR_855NM: usize = 11;
+    pub const CLEAR: usize = 12;
+    pub const FLICKER: usize = 13;
+
+    /// Create a new spectral reading for protocol transfer
+    pub fn new(
+        id: u64,
+        timestamp_us: i64,
+        channels: [u16; 14],
+        gain: u8,
+        saturated: bool,
+    ) -> Self {
+        Self {
+            id,
+            timestamp_us,
+            channels,
+            gain,
+            saturated,
+        }
     }
 }
 
@@ -372,6 +442,46 @@ pub enum DbResponse {
         /// Approximate storage free in bytes
         free_bytes: u64,
     },
+
+    // ========================================================================
+    // Spectral sensor responses
+    // ========================================================================
+
+    /// Spectral readings response
+    #[cfg(not(feature = "std"))]
+    SpectralReadings {
+        data: heapless::Vec<SpectralReadingProtocol, MAX_SPECTRAL_READINGS_PER_RESPONSE>,
+        total: u32,
+        has_more: bool,
+    },
+    #[cfg(feature = "std")]
+    SpectralReadings {
+        data: Vec<SpectralReadingProtocol>,
+        total: u32,
+        has_more: bool,
+    },
+
+    /// Spectral database statistics
+    SpectralStats {
+        /// Total number of spectral readings
+        total_readings: u32,
+        /// Oldest timestamp (microseconds)
+        oldest_timestamp_us: i64,
+        /// Newest timestamp (microseconds)
+        newest_timestamp_us: i64,
+        /// Current snapshot ID
+        snapshot_id: u64,
+    },
+
+    /// Log message (for debugging without probe)
+    #[cfg(not(feature = "std"))]
+    Log {
+        message: heapless::String<128>,
+    },
+    #[cfg(feature = "std")]
+    Log {
+        message: String,
+    },
 }
 
 impl DbResponse {
@@ -395,6 +505,21 @@ impl DbResponse {
         }
     }
 
+    /// Create log message (for serial debugging)
+    #[cfg(not(feature = "std"))]
+    pub fn log(msg: &str) -> Self {
+        let message = heapless::String::try_from(msg).unwrap_or_default();
+        Self::Log { message }
+    }
+
+    /// Create log message (std version)
+    #[cfg(feature = "std")]
+    pub fn log(msg: &str) -> Self {
+        Self::Log {
+            message: msg.to_string(),
+        }
+    }
+
     /// Create readings response
     #[cfg(not(feature = "std"))]
     pub fn readings(readings: &[TemperatureReading], total: u32, has_more: bool) -> Self {
@@ -414,6 +539,41 @@ impl DbResponse {
     #[cfg(feature = "std")]
     pub fn readings(readings: &[TemperatureReading], total: u32, has_more: bool) -> Self {
         Self::Readings {
+            data: readings.to_vec(),
+            total,
+            has_more,
+        }
+    }
+
+    /// Create spectral readings response
+    #[cfg(not(feature = "std"))]
+    pub fn spectral_readings(
+        readings: &[SpectralReadingProtocol],
+        total: u32,
+        has_more: bool,
+    ) -> Self {
+        let mut data = heapless::Vec::new();
+        for reading in readings
+            .iter()
+            .take(MAX_SPECTRAL_READINGS_PER_RESPONSE)
+        {
+            let _ = data.push(reading.clone());
+        }
+        Self::SpectralReadings {
+            data,
+            total,
+            has_more,
+        }
+    }
+
+    /// Create spectral readings response (std version)
+    #[cfg(feature = "std")]
+    pub fn spectral_readings(
+        readings: &[SpectralReadingProtocol],
+        total: u32,
+        has_more: bool,
+    ) -> Self {
+        Self::SpectralReadings {
             data: readings.to_vec(),
             total,
             has_more,
@@ -490,5 +650,20 @@ impl DbCommand {
     /// Create capacity command
     pub fn capacity() -> Self {
         Self::Capacity
+    }
+
+    /// Create query spectral latest command
+    pub fn query_spectral_latest(count: u16) -> Self {
+        Self::QuerySpectralLatest { count }
+    }
+
+    /// Create query spectral range command
+    pub fn query_spectral_range(start_us: i64, end_us: i64) -> Self {
+        Self::QuerySpectralRange { start_us, end_us }
+    }
+
+    /// Create spectral stats command
+    pub fn spectral_stats() -> Self {
+        Self::SpectralStats
     }
 }

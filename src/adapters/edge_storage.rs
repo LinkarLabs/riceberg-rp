@@ -12,8 +12,8 @@ use riceberg_edge::{CompareOp, EdgeDatabase, EntityId, PredicateValue, QueryBuil
 
 use riceberg_core::CompactionConfig;
 
-use crate::db_protocol::{FilterOp, FilterValue, QueryFilter};
-use crate::domain::{SensorId, SensorReading};
+use crate::db_protocol::{FilterOp, FilterValue, QueryFilter, SpectralReadingProtocol};
+use crate::domain::{SensorId, SensorReading, SpectralReading};
 use crate::ports::storage::{
     CapacityResult, CompactionResult, ExpireResult, StorageError, StoragePort, StorageStats,
     MAX_QUERY_RESULTS,
@@ -29,8 +29,12 @@ pub struct EdgeStorageAdapter<S: Storage + MaybeSendSync> {
     db: EdgeDatabase<S>,
     /// Cached table ID for the temperature table
     table_id: Option<u32>,
+    /// Cached table ID for the spectral table
+    spectral_table_id: Option<u32>,
     /// Next ID counter for readings (auto-increment)
     next_id: u64,
+    /// Next ID counter for spectral readings (auto-increment)
+    next_spectral_id: u64,
 }
 
 impl<S: Storage + MaybeSendSync> EdgeStorageAdapter<S> {
@@ -41,7 +45,9 @@ impl<S: Storage + MaybeSendSync> EdgeStorageAdapter<S> {
         Self {
             db,
             table_id: None,
-            next_id: 1, // Start IDs at 1
+            spectral_table_id: None,
+            next_id: 1,
+            next_spectral_id: 1,
         }
     }
 
@@ -96,6 +102,273 @@ impl<S: Storage + MaybeSendSync> EdgeStorageAdapter<S> {
             .optional("sensor_id", FieldType::String)
             .unwrap()
             .build()
+    }
+
+    // ========================================================================
+    // Spectral Table Support
+    // ========================================================================
+
+    /// Create the spectral readings schema
+    ///
+    /// Schema fields (16 total - matches riceberg memory-minimal MAX_INLINE_FIELDS):
+    /// - 0: timestamp_us (Int64) - Microseconds since boot
+    /// - 1-12: spectral channels (Int64) - F1, F2, FZ, F3, F4, F5, FY, FXL, F6, F7, F8, NIR
+    /// - 13: clear (Int64) - Clear channel
+    /// - 14: flicker (Int64) - Flicker channel
+    /// - 15: metadata (Int64) - low byte = gain, bit 8 = saturated
+    ///
+    /// Note: `id` is not stored as a schema field. The entity ID is passed
+    /// separately via `EntityId` when using `EdgeDatabase::save()`.
+    fn create_spectral_schema() -> riceberg_core::Schema {
+        SchemaBuilder::new(1)
+            .required("timestamp_us", FieldType::Int64)
+            .unwrap()
+            .required("f1_405nm", FieldType::Int64)
+            .unwrap()
+            .required("f2_425nm", FieldType::Int64)
+            .unwrap()
+            .required("fz_450nm", FieldType::Int64)
+            .unwrap()
+            .required("f3_475nm", FieldType::Int64)
+            .unwrap()
+            .required("f4_515nm", FieldType::Int64)
+            .unwrap()
+            .required("f5_550nm", FieldType::Int64)
+            .unwrap()
+            .required("fy_555nm", FieldType::Int64)
+            .unwrap()
+            .required("fxl_600nm", FieldType::Int64)
+            .unwrap()
+            .required("f6_640nm", FieldType::Int64)
+            .unwrap()
+            .required("f7_690nm", FieldType::Int64)
+            .unwrap()
+            .required("f8_745nm", FieldType::Int64)
+            .unwrap()
+            .required("nir_855nm", FieldType::Int64)
+            .unwrap()
+            .required("clear", FieldType::Int64)
+            .unwrap()
+            .required("flicker", FieldType::Int64)
+            .unwrap()
+            .required("metadata", FieldType::Int64)
+            .unwrap()
+            .build()
+    }
+
+    /// Pack gain and saturated flag into a single i64 metadata value
+    fn pack_metadata(gain: u8, saturated: bool) -> i64 {
+        gain as i64 | if saturated { 1 << 8 } else { 0 }
+    }
+
+    /// Unpack gain and saturated flag from metadata value
+    fn unpack_metadata(metadata: i64) -> (u8, bool) {
+        let gain = (metadata & 0xFF) as u8;
+        let saturated = (metadata & (1 << 8)) != 0;
+        (gain, saturated)
+    }
+
+    /// Initialize the spectral table
+    pub async fn initialize_spectral(&mut self) -> Result<(), StorageError> {
+        let schema = Self::create_spectral_schema();
+        let table_id = self
+            .db
+            .register_table("spectral", schema)
+            .await
+            .map_err(|_| StorageError::TableError)?;
+        self.spectral_table_id = Some(table_id);
+        Ok(())
+    }
+
+    /// Get the spectral table ID (after initialization)
+    pub fn spectral_table_id(&self) -> Option<u32> {
+        self.spectral_table_id
+    }
+
+    /// Store a spectral reading
+    pub async fn store_spectral(
+        &mut self,
+        reading: &SpectralReading,
+    ) -> Result<(), StorageError> {
+        let table_id = self
+            .spectral_table_id
+            .ok_or(StorageError::NotInitialized)?;
+
+        let id = self.next_spectral_id;
+        self.next_spectral_id += 1;
+
+        let channels = reading.all_channels();
+        let metadata = Self::pack_metadata(reading.gain, reading.saturated);
+
+        self.db
+            .save(table_id, EntityId(id as i64), |row| {
+                row.set(0, Value::Int64(reading.timestamp_us))?;
+                for i in 0..14 {
+                    row.set(1 + i, Value::Int64(channels[i] as i64))?;
+                }
+                row.set(15, Value::Int64(metadata))?;
+                Ok(())
+            })
+            .await
+            .map_err(|_| StorageError::InsertFailed)?;
+
+        Ok(())
+    }
+
+    /// Get the latest N spectral readings
+    pub async fn get_spectral_latest(
+        &mut self,
+        count: u16,
+    ) -> Result<AllocVec<SpectralReadingProtocol>, StorageError> {
+        let table_id = self
+            .spectral_table_id
+            .ok_or(StorageError::NotInitialized)?;
+        let schema = self
+            .db
+            .schema(table_id)
+            .ok_or(StorageError::SchemaNotFound)?
+            .clone();
+
+        let scan = riceberg_core::ScanBuilder::new(self.db.storage(), table_id, &schema)
+            .await
+            .map_err(|_| StorageError::QueryFailed)?
+            .build()
+            .await
+            .map_err(|_| StorageError::QueryFailed)?;
+
+        let mut results = riceberg_core::ScanResults::new(scan);
+        let mut all_readings = AllocVec::new();
+
+        while let Ok(Some(row)) = results.next_row().await {
+            if let Some(reading) = Self::row_to_spectral_protocol(&row) {
+                all_readings.push(reading);
+            }
+        }
+
+        let count = count as usize;
+        let start_idx = all_readings.len().saturating_sub(count);
+        Ok(all_readings.split_off(start_idx))
+    }
+
+    /// Get spectral readings in a time range
+    pub async fn get_spectral_range(
+        &mut self,
+        start_us: i64,
+        end_us: i64,
+    ) -> Result<AllocVec<SpectralReadingProtocol>, StorageError> {
+        let table_id = self
+            .spectral_table_id
+            .ok_or(StorageError::NotInitialized)?;
+        let schema = self
+            .db
+            .schema(table_id)
+            .ok_or(StorageError::SchemaNotFound)?
+            .clone();
+
+        let scan = riceberg_core::ScanBuilder::new(self.db.storage(), table_id, &schema)
+            .await
+            .map_err(|_| StorageError::QueryFailed)?
+            .build()
+            .await
+            .map_err(|_| StorageError::QueryFailed)?;
+
+        let mut results = riceberg_core::ScanResults::new(scan);
+        let mut output = AllocVec::new();
+
+        while let Ok(Some(row)) = results.next_row().await {
+            if let Some(reading) = Self::row_to_spectral_protocol(&row) {
+                if reading.timestamp_us >= start_us && reading.timestamp_us <= end_us {
+                    output.push(reading);
+                }
+            }
+        }
+
+        Ok(output)
+    }
+
+    /// Get spectral table statistics
+    pub async fn spectral_stats(&mut self) -> Result<StorageStats, StorageError> {
+        let table_id = self
+            .spectral_table_id
+            .ok_or(StorageError::NotInitialized)?;
+        let schema = self
+            .db
+            .schema(table_id)
+            .ok_or(StorageError::SchemaNotFound)?
+            .clone();
+
+        let scan = riceberg_core::ScanBuilder::new(self.db.storage(), table_id, &schema)
+            .await
+            .map_err(|_| StorageError::QueryFailed)?
+            .build()
+            .await
+            .map_err(|_| StorageError::QueryFailed)?;
+
+        let mut results = riceberg_core::ScanResults::new(scan);
+        let mut count = 0u32;
+        let mut oldest = i64::MAX;
+        let mut newest = i64::MIN;
+
+        while let Ok(Some(row)) = results.next_row().await {
+            count += 1;
+            if let Ok(Some(Value::Int64(ts))) = row.get(0) {
+                oldest = oldest.min(ts);
+                newest = newest.max(ts);
+            }
+        }
+
+        Ok(StorageStats {
+            total_readings: count,
+            oldest_timestamp_us: if count > 0 { oldest } else { 0 },
+            newest_timestamp_us: if count > 0 { newest } else { 0 },
+            snapshot_id: self.db.current_snapshot_id(),
+        })
+    }
+
+    /// Convert a database row to a SpectralReadingProtocol
+    ///
+    /// Schema layout (16 fields, no id field):
+    /// - 0: timestamp_us, 1-12: spectral channels, 13: clear, 14: flicker, 15: metadata
+    fn row_to_spectral_protocol(
+        row: &riceberg_core::ScannedRow<'_>,
+    ) -> Option<SpectralReadingProtocol> {
+        let timestamp_us = match row.get(0) {
+            Ok(Some(Value::Int64(v))) => v,
+            _ => return None,
+        };
+
+        let mut channels = [0u16; 14];
+        // Fields 1-12: spectral channels (F1..NIR)
+        for i in 0..12 {
+            channels[i] = match row.get(1 + i) {
+                Ok(Some(Value::Int64(v))) => v as u16,
+                _ => 0,
+            };
+        }
+        // Field 13: clear
+        channels[12] = match row.get(13) {
+            Ok(Some(Value::Int64(v))) => v as u16,
+            _ => 0,
+        };
+        // Field 14: flicker
+        channels[13] = match row.get(14) {
+            Ok(Some(Value::Int64(v))) => v as u16,
+            _ => 0,
+        };
+
+        // Field 15: packed metadata (gain + saturated)
+        let (gain, saturated) = match row.get(15) {
+            Ok(Some(Value::Int64(v))) => Self::unpack_metadata(v),
+            _ => (0, false),
+        };
+
+        Some(SpectralReadingProtocol::new(
+            0,
+            timestamp_us,
+            channels,
+            gain,
+            saturated,
+        ))
     }
 
     /// Convert a database row to a SensorReading

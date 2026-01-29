@@ -27,6 +27,7 @@
 //! - **USB Task**: Handles USB enumeration and communication (spawned separately for reliability)
 //! - **DB Task**: Owns the database, processes all reads and writes sequentially
 //! - **Sensor Task**: Reads ADC temperature sensor, sends readings via channel to DB task
+//! - **Spectral Sensor Task**: Reads AS7343 spectral sensor via I2C, sends readings via channel
 //! - **Query Handler**: Receives USB commands, forwards to DB task via channel
 //!
 //! All database operations are serialized through the DB task to avoid concurrency issues.
@@ -57,7 +58,10 @@ use riceberg_core::{
 };
 use riceberg_storage::{BlockDeviceStorage, NorFlashBlockDevice};
 
-use rp::db_protocol::{DbCommand, DbResponse, TemperatureReading};
+use rp::adapters::As7343Adapter;
+use rp::db_protocol::{DbCommand, DbResponse, SpectralReadingProtocol, TemperatureReading};
+use rp::domain::{SensorId, SpectralReading};
+use rp::ports::SpectralSensorPort;
 
 // ============================================================================
 // Memory Configuration
@@ -92,6 +96,9 @@ const FLASH_PAGES_4KB: u32 = 128;
 /// How often to read the temperature sensor (seconds)
 const READING_INTERVAL_SECS: u64 = 5;
 
+/// How often to read the spectral sensor (seconds)
+const SPECTRAL_INTERVAL_SECS: u64 = 1;
+
 /// Maximum message size for USB
 const MAX_MSG_SIZE: usize = 8192;
 
@@ -102,6 +109,7 @@ const MAX_MSG_SIZE: usize = 8192;
 type FlashDevice = Flash<'static, peripherals::FLASH, Async, { 2 * 1024 * 1024 }>;
 type EdgeStorage = BlockDeviceStorage<NorFlashBlockDevice<FlashDevice>>;
 type EdgeDatabase = Database<EdgeStorage>;
+type I2cDevice = embassy_rp::i2c::I2c<'static, peripherals::I2C0, embassy_rp::i2c::Async>;
 
 // ============================================================================
 // Channels for Inter-Task Communication
@@ -116,6 +124,9 @@ struct SensorReading {
 
 /// Channel for sending sensor readings to DB task
 static READINGS_CHANNEL: Channel<CriticalSectionRawMutex, SensorReading, 32> = Channel::new();
+
+/// Channel for sending spectral readings to DB task
+static SPECTRAL_CHANNEL: Channel<CriticalSectionRawMutex, SpectralReading, 8> = Channel::new();
 
 /// Channel for sending DB commands from query handler to DB task
 static DB_CMD_CHANNEL: Channel<CriticalSectionRawMutex, DbCommand, 4> = Channel::new();
@@ -156,6 +167,13 @@ static DB_INSERT_FAILED: core::sync::atomic::AtomicU32 =
 static DB_COMMIT_FAILED: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
+/// Flag to indicate spectral sensor task is running
+static SPECTRAL_TASK_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Counter for spectral readings sent
+static SPECTRAL_READINGS_SENT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 // ============================================================================
 // Interrupt Bindings
 // ============================================================================
@@ -163,6 +181,7 @@ static DB_COMMIT_FAILED: core::sync::atomic::AtomicU32 =
 bind_interrupts!(struct Irqs {
     ADC_IRQ_FIFO => embassy_rp::adc::InterruptHandler;
     USBCTRL_IRQ => UsbInterruptHandler<peripherals::USB>;
+    I2C0_IRQ => embassy_rp::i2c::InterruptHandler<peripherals::I2C0>;
 });
 
 // ============================================================================
@@ -179,6 +198,63 @@ fn create_temperature_schema() -> Schema {
         .optional("sensor_id", FieldType::String)
         .unwrap()
         .build()
+}
+
+/// Create schema for spectral readings table
+///
+/// Schema fields (16 total - matches riceberg memory-minimal MAX_INLINE_FIELDS):
+/// - 0: timestamp_us (Int64)
+/// - 1-12: spectral channels F1, F2, FZ, F3, F4, F5, FY, FXL, F6, F7, F8, NIR (Int64)
+/// - 13: clear (Int64)
+/// - 14: flicker (Int64)
+/// - 15: metadata (Int64) - low byte = gain, bit 8 = saturated
+fn create_spectral_schema() -> Schema {
+    SchemaBuilder::new(1)
+        .required("timestamp_us", FieldType::Int64)
+        .unwrap()
+        .required("f1_405nm", FieldType::Int64)
+        .unwrap()
+        .required("f2_425nm", FieldType::Int64)
+        .unwrap()
+        .required("fz_450nm", FieldType::Int64)
+        .unwrap()
+        .required("f3_475nm", FieldType::Int64)
+        .unwrap()
+        .required("f4_515nm", FieldType::Int64)
+        .unwrap()
+        .required("f5_550nm", FieldType::Int64)
+        .unwrap()
+        .required("fy_555nm", FieldType::Int64)
+        .unwrap()
+        .required("fxl_600nm", FieldType::Int64)
+        .unwrap()
+        .required("f6_640nm", FieldType::Int64)
+        .unwrap()
+        .required("f7_690nm", FieldType::Int64)
+        .unwrap()
+        .required("f8_745nm", FieldType::Int64)
+        .unwrap()
+        .required("nir_855nm", FieldType::Int64)
+        .unwrap()
+        .required("clear", FieldType::Int64)
+        .unwrap()
+        .required("flicker", FieldType::Int64)
+        .unwrap()
+        .required("metadata", FieldType::Int64)
+        .unwrap()
+        .build()
+}
+
+/// Pack gain and saturated flag into a single i64 metadata value
+fn pack_metadata(gain: u8, saturated: bool) -> i64 {
+    gain as i64 | if saturated { 1 << 8 } else { 0 }
+}
+
+/// Unpack gain and saturated flag from metadata value
+fn unpack_metadata(metadata: i64) -> (u8, bool) {
+    let gain = (metadata & 0xFF) as u8;
+    let saturated = (metadata & (1 << 8)) != 0;
+    (gain, saturated)
 }
 
 // ============================================================================
@@ -217,7 +293,7 @@ async fn main(spawner: embassy_executor::Spawner) {
         unsafe { HEAP.init(addr_of_mut!(HEAP_MEM) as usize, HEAP_SIZE) }
     }
 
-    info!("=== Riceberg Temperature Sensor with USB ===");
+    info!("=== Riceberg Temperature + Spectral Sensor with USB ===");
 
     // Initialize peripherals
     let p = embassy_rp::init(Default::default());
@@ -306,6 +382,21 @@ async fn main(spawner: embassy_executor::Spawner) {
     // Spawn sensor task (reads ADC, sends to channel)
     spawner.spawn(sensor_task(adc_peripheral, temp_sensor).expect("sensor task"));
 
+    // Initialize I2C for AS7343 spectral sensor (QWIIC: GPIO4=SDA, GPIO5=SCL)
+    // Done after USB setup so USB enumeration is not blocked by I2C issues
+    let i2c = embassy_rp::i2c::I2c::new_async(
+        p.I2C0,
+        p.PIN_5, // SCL
+        p.PIN_4, // SDA
+        Irqs,
+        embassy_rp::i2c::Config::default(),
+    );
+    let spectral_sensor = As7343Adapter::new(i2c, SensorId::AS7343);
+
+    // Spawn spectral sensor task (reads AS7343 via I2C, sends to channel)
+    // Sensor init happens inside the task to avoid blocking USB enumeration
+    spawner.spawn(spectral_sensor_task(spectral_sensor).expect("spectral task"));
+
     info!("All tasks spawned!");
 
     // Query handler runs in main context, forwards commands to DB task
@@ -375,6 +466,27 @@ async fn db_task(storage: EdgeStorage) {
         },
     };
 
+    // Create/get spectral table
+    let spectral_schema = create_spectral_schema();
+    let spectral_table_id = match db.get_table("spectral") {
+        Some(id) => {
+            info!("Spectral table exists (ID: {})", id);
+            id
+        }
+        None => match db.create_table("spectral", spectral_schema.clone()).await {
+            Ok(id) => {
+                info!("Spectral table created (ID: {})", id);
+                id
+            }
+            Err(_) => {
+                error!("Failed to create spectral table");
+                loop {
+                    Timer::after(Duration::from_secs(3600)).await;
+                }
+            }
+        },
+    };
+
     // Write test readings to verify database is working
     for i in 0..3 {
         info!("Writing TEST reading #{}...", i + 1);
@@ -415,11 +527,19 @@ async fn db_task(storage: EdgeStorage) {
     DB_READY.store(true, Ordering::Release);
     info!("DB task ready");
 
-    // Main loop: handle sensor writes and query requests sequentially
+    // Main loop: handle sensor writes, spectral writes, and query requests
     loop {
         // Check for query commands (priority)
         if let Ok(cmd) = DB_CMD_CHANNEL.try_receive() {
-            let response = process_db_command(&mut db, table_id, &schema, cmd).await;
+            let response = process_db_command(
+                &mut db,
+                table_id,
+                &schema,
+                spectral_table_id,
+                &spectral_schema,
+                cmd,
+            )
+            .await;
             DB_RESP_CHANNEL.send(response).await;
             continue;
         }
@@ -439,7 +559,39 @@ async fn db_task(storage: EdgeStorage) {
             {
                 Ok(()) => match txn.commit().await {
                     Ok(snap) => {
-                        // CRITICAL: Must notify database of commit!
+                        db.notify_commit(snap);
+                        DB_WRITES_SUCCESS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        DB_COMMIT_FAILED.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+                Err(_) => {
+                    DB_INSERT_FAILED.fetch_add(1, Ordering::Relaxed);
+                    txn.abort().await;
+                }
+            }
+            continue;
+        }
+
+        // Check for spectral readings
+        if let Ok(reading) = SPECTRAL_CHANNEL.try_receive() {
+            let channels = reading.all_channels();
+            let metadata = pack_metadata(reading.gain, reading.saturated);
+            let mut txn = db.begin_write();
+            match txn
+                .insert(spectral_table_id, &spectral_schema, |row| {
+                    row.set(0, Value::Int64(reading.timestamp_us))?;
+                    for i in 0..14 {
+                        row.set(1 + i, Value::Int64(channels[i] as i64))?;
+                    }
+                    row.set(15, Value::Int64(metadata))?;
+                    Ok(())
+                })
+                .await
+            {
+                Ok(()) => match txn.commit().await {
+                    Ok(snap) => {
                         db.notify_commit(snap);
                         DB_WRITES_SUCCESS.fetch_add(1, Ordering::Relaxed);
                     }
@@ -465,11 +617,12 @@ async fn process_db_command(
     db: &mut EdgeDatabase,
     table_id: u32,
     schema: &Schema,
+    spectral_table_id: u32,
+    spectral_schema: &Schema,
     command: DbCommand,
 ) -> DbResponse {
     match command {
         DbCommand::Stats => {
-            // Scan in isolated scope to ensure scan is dropped before returning
             let scan_result: Result<(u32, i64, i64), &'static str> = async {
                 let builder = match ScanBuilder::new(db.storage(), table_id, schema).await {
                     Ok(b) => b,
@@ -522,6 +675,53 @@ async fn process_db_command(
             last_adc_value: LAST_ADC_VALUE.load(Ordering::Relaxed),
             uptime_ms: embassy_time::Instant::now().as_millis(),
         },
+
+        // Spectral commands
+        DbCommand::QuerySpectralLatest { count } => {
+            query_spectral_latest(db, spectral_table_id, spectral_schema, count as usize).await
+        }
+        DbCommand::QuerySpectralRange { start_us, end_us } => {
+            query_spectral_range(db, spectral_table_id, spectral_schema, start_us, end_us).await
+        }
+        DbCommand::SpectralStats => {
+            let scan_result: Result<(u32, i64, i64), &'static str> = async {
+                let builder =
+                    match ScanBuilder::new(db.storage(), spectral_table_id, spectral_schema).await {
+                        Ok(b) => b,
+                        Err(_) => return Err("Failed to create spectral scan"),
+                    };
+                let scan = match builder.build().await {
+                    Ok(s) => s,
+                    Err(_) => return Err("Failed to build spectral scan"),
+                };
+                let mut results = ScanResults::new(scan);
+                let mut count = 0u32;
+                let mut oldest = i64::MAX;
+                let mut newest = i64::MIN;
+                while let Ok(Some(row)) = results.next_row().await {
+                    count += 1;
+                    if let Ok(Some(Value::Int64(ts))) = row.get(0) {
+                        oldest = oldest.min(ts);
+                        newest = newest.max(ts);
+                    }
+                }
+                Ok((count, oldest, newest))
+            }
+            .await;
+
+            match scan_result {
+                Ok((count, oldest, newest)) => DbResponse::SpectralStats {
+                    total_readings: count,
+                    oldest_timestamp_us: if count > 0 { oldest } else { 0 },
+                    newest_timestamp_us: if count > 0 { newest } else { 0 },
+                    snapshot_id: db.current_snapshot_id(),
+                },
+                Err(msg) => DbResponse::error(msg),
+            }
+        }
+
+        // Unhandled commands for this example
+        _ => DbResponse::error("Command not supported"),
     }
 }
 
@@ -570,6 +770,66 @@ async fn sensor_task(
         }
 
         Timer::after(Duration::from_secs(READING_INTERVAL_SECS)).await;
+    }
+}
+
+// ============================================================================
+// Spectral Sensor Task
+// ============================================================================
+
+/// Spectral sensor task - reads AS7343 via I2C and sends to channel
+#[embassy_executor::task]
+async fn spectral_sensor_task(mut sensor: As7343Adapter<I2cDevice>) {
+    SPECTRAL_TASK_RUNNING.store(true, Ordering::Release);
+    info!("Spectral sensor task started");
+
+    // Initialize sensor (retry up to 5 times)
+    let mut initialized = false;
+    for attempt in 1..=5 {
+        info!("AS7343 init attempt {}/5...", attempt);
+        match sensor.init().await {
+            Ok(()) => {
+                info!("AS7343 initialized successfully");
+                initialized = true;
+                break;
+            }
+            Err(e) => {
+                warn!("AS7343 init attempt {} failed: {}", attempt, e);
+                Timer::after(Duration::from_millis(500)).await;
+            }
+        }
+    }
+
+    if !initialized {
+        error!("AS7343 init failed after 5 attempts - spectral task stopping");
+        SPECTRAL_TASK_RUNNING.store(false, Ordering::Release);
+        return;
+    }
+
+    // Wait for database to be ready
+    while !DB_READY.load(Ordering::Acquire) {
+        Timer::after(Duration::from_millis(500)).await;
+    }
+    info!("Spectral task: DB ready, starting readings");
+
+    loop {
+        match sensor.read().await {
+            Ok(reading) => {
+                match SPECTRAL_CHANNEL.try_send(reading) {
+                    Ok(()) => {
+                        SPECTRAL_READINGS_SENT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        // Channel full - reading lost
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Spectral read failed: {}", e);
+            }
+        }
+
+        Timer::after(Duration::from_secs(SPECTRAL_INTERVAL_SECS)).await;
     }
 }
 
@@ -675,7 +935,7 @@ async fn query_latest(
                     if let (Ok(Some(Value::Int64(ts))), Ok(Some(Value::Float32(temp)))) =
                         (row.get(0), row.get(1))
                     {
-                        if let Some(reading) = TemperatureReading::new(ts, temp, "onboard") {
+                        if let Some(reading) = TemperatureReading::new(0, ts, temp, "onboard") {
                             all_readings.push(reading);
                         }
                     }
@@ -715,7 +975,7 @@ async fn query_range(
                         (row.get(0), row.get(1))
                     {
                         if ts >= start_us && ts <= end_us {
-                            if let Some(reading) = TemperatureReading::new(ts, temp, "onboard") {
+                            if let Some(reading) = TemperatureReading::new(0, ts, temp, "onboard") {
                                 readings.push(reading);
                             }
                         }
@@ -748,7 +1008,7 @@ async fn query_scan(
                     if let (Ok(Some(Value::Int64(ts))), Ok(Some(Value::Float32(temp)))) =
                         (row.get(0), row.get(1))
                     {
-                        if let Some(reading) = TemperatureReading::new(ts, temp, "onboard") {
+                        if let Some(reading) = TemperatureReading::new(0, ts, temp, "onboard") {
                             all_readings.push(reading);
                         }
                     }
@@ -764,5 +1024,110 @@ async fn query_scan(
             Err(_) => DbResponse::error("Failed to build scan"),
         },
         Err(_) => DbResponse::error("Failed to create scan"),
+    }
+}
+
+// ============================================================================
+// Spectral Query Functions
+// ============================================================================
+
+/// Helper to convert a spectral scan row to SpectralReadingProtocol
+fn row_to_spectral(row: &riceberg_core::ScannedRow<'_>) -> Option<SpectralReadingProtocol> {
+    let timestamp_us = match row.get(0) {
+        Ok(Some(Value::Int64(v))) => v,
+        _ => return None,
+    };
+
+    let mut channels = [0u16; 14];
+    // Fields 1-12: spectral channels (F1..NIR)
+    for i in 0..12 {
+        channels[i] = match row.get(1 + i) {
+            Ok(Some(Value::Int64(v))) => v as u16,
+            _ => 0,
+        };
+    }
+    // Field 13: clear
+    channels[12] = match row.get(13) {
+        Ok(Some(Value::Int64(v))) => v as u16,
+        _ => 0,
+    };
+    // Field 14: flicker
+    channels[13] = match row.get(14) {
+        Ok(Some(Value::Int64(v))) => v as u16,
+        _ => 0,
+    };
+
+    let (gain, saturated) = match row.get(15) {
+        Ok(Some(Value::Int64(v))) => unpack_metadata(v),
+        _ => (0, false),
+    };
+
+    // Use 0 for ID since the example schema doesn't have a separate ID field
+    Some(SpectralReadingProtocol::new(
+        0,
+        timestamp_us,
+        channels,
+        gain,
+        saturated,
+    ))
+}
+
+async fn query_spectral_latest(
+    db: &mut EdgeDatabase,
+    table_id: u32,
+    schema: &Schema,
+    count: usize,
+) -> DbResponse {
+    match ScanBuilder::new(db.storage(), table_id, schema).await {
+        Ok(builder) => match builder.build().await {
+            Ok(scan) => {
+                let mut results = ScanResults::new(scan);
+                let mut all_readings = alloc::vec::Vec::new();
+
+                while let Ok(Some(row)) = results.next_row().await {
+                    if let Some(reading) = row_to_spectral(&row) {
+                        all_readings.push(reading);
+                    }
+                }
+
+                let total = all_readings.len() as u32;
+                let start_idx = all_readings.len().saturating_sub(count);
+                let readings = &all_readings[start_idx..];
+                DbResponse::spectral_readings(readings, total, false)
+            }
+            Err(_) => DbResponse::error("Failed to build spectral scan"),
+        },
+        Err(_) => DbResponse::error("Failed to create spectral scan"),
+    }
+}
+
+async fn query_spectral_range(
+    db: &mut EdgeDatabase,
+    table_id: u32,
+    schema: &Schema,
+    start_us: i64,
+    end_us: i64,
+) -> DbResponse {
+    match ScanBuilder::new(db.storage(), table_id, schema).await {
+        Ok(builder) => match builder.build().await {
+            Ok(scan) => {
+                let mut results = ScanResults::new(scan);
+                let mut readings = alloc::vec::Vec::new();
+
+                while let Ok(Some(row)) = results.next_row().await {
+                    if let Some(reading) = row_to_spectral(&row) {
+                        if reading.timestamp_us >= start_us && reading.timestamp_us <= end_us {
+                            readings.push(reading);
+                        }
+                    }
+                }
+
+                let total = readings.len();
+                let has_more = total > 16;
+                DbResponse::spectral_readings(&readings[..total.min(16)], total as u32, has_more)
+            }
+            Err(_) => DbResponse::error("Failed to build spectral scan"),
+        },
+        Err(_) => DbResponse::error("Failed to create spectral scan"),
     }
 }

@@ -69,6 +69,9 @@ impl SensorId {
     /// Test/mock sensor
     pub const TEST: SensorId = SensorId(255);
 
+    /// AS7343 14-channel spectral sensor
+    pub const AS7343: SensorId = SensorId(10);
+
     /// Create a new sensor ID from a raw value
     pub const fn new(id: u8) -> Self {
         Self(id)
@@ -81,6 +84,7 @@ impl SensorId {
             1 => "external_1",
             2 => "external_2",
             3 => "external_3",
+            10 => "as7343",
             255 => "test",
             _ => "unknown",
         }
